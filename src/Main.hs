@@ -6,6 +6,7 @@ import Control.Applicative
 import Control.Concurrent
 import Control.Concurrent.MVar
 import Control.Concurrent.Chan
+import Control.Exception
 import Data.Monoid
 import System.Random
 import System.Environment
@@ -19,6 +20,7 @@ import qualified Data.Text.IO          as T.IO
 import qualified Data.Text.Encoding    as T.E
 import qualified Network.Simple.TCP    as Net
 import qualified Network.HTTP          as HTTP
+import qualified Network.Stream        as NS
 import qualified Data.Aeson            as JSON
 
 --base_url = "https://qwebirc.swiftirc.net/"
@@ -36,7 +38,11 @@ data Client = MkClient {
 }
 
 
-request :: JSON.FromJSON ret => Client -> Char -> [(String, String)] -> IO (Maybe ret)
+data RequestError = ParsingError !String !String
+                  | ConnectError !NS.ConnError
+    deriving(Show)
+
+request :: JSON.FromJSON ret => Client -> Char -> [(String, String)] -> IO (Either RequestError ret)
 request (MkClient base_url tim _) char params = do
         !n <- takeMVar tim
         putMVar tim (n+1)
@@ -45,94 +51,119 @@ request (MkClient base_url tim _) char params = do
         let url = b2s base_url ++ "e/" ++ [char] ++ getParams
         ret <- HTTP.simpleHTTP (HTTP.postRequestWithBody url "application/x-www-form-urlencoded" (HTTP.urlEncodeVars params))
         case ret of
-             Left {} -> return Nothing
+             Left e -> return (Left (ConnectError e))
              Right (HTTP.Response {HTTP.rspBody=ret}) -> do
                 let v = JSON.decode . L.fromStrict . s2b $ ret
-                case v of Nothing -> do putStrLn "Error decoding (raw stuff)"
-                                        putStrLn $ "URL: " ++ url
-                                        putStrLn $ ret
-                                        return Nothing
-                          Just x -> return x
+                case v of Nothing -> return (Left (ParsingError url ret))
+                          Just x  -> return (Right x)
 
 
-connect :: C8.ByteString -> String -> IO Client
+connect :: C8.ByteString -> String -> IO (Either RequestError Client)
 connect base_url nick = do
     tim <- newMVar 0
     let tmpClient = MkClient base_url tim "<ignored>"
     session <- request tmpClient 'n' [("nick", nick)]
-    case session of
-         Just (_:JSON.String sess_id:_) -> return $ MkClient base_url tim sess_id
-         x -> error "magic"
+    return $ do (_:JSON.String sess_id:_) <- session
+                return (MkClient base_url tim sess_id)
 
-send :: Client -> T.Text -> IO ()
+send :: Client -> T.Text -> IO (Either RequestError ())
 send client payload = do
-    request client 'p' [("s", T.unpack $ session client), ("c", T.unpack payload)] :: IO (Maybe ())
-    return ()
+    request client 'p' [("s", T.unpack $ session client), ("c", T.unpack payload)]
 
-recv :: Client -> IO [T.Text]
+
+data Message = Message    !T.Text
+             | Disconnect !T.Text
+             | Connect
+             | Err        ![JSON.Value] !String
+    deriving (Show)
+recv :: Client -> IO (Either RequestError [Message])
 recv client = do
     ret <- request client 's' [("s", T.unpack $ session client)]
-    case recv_magic =<< ret of
-         Nothing -> return [] -- throwIO 
-         Just r  -> return r
+    return $ fmap recv_magic ret
 
-recv_magic :: [[JSON.Value]] -> Maybe [T.Text]
-recv_magic xs = foldr (<>) mempty $ map (\x -> (:[]) <$> f x) xs where
-    f [JSON.String "c",JSON.String command,JSON.String prefix,JSON.Array args] =
-        go ((if T.null prefix then "" else ":" <> prefix <> " ") <>
+recv_magic :: [[JSON.Value]] -> [Message]
+recv_magic xs = map f xs where
+    f x@[JSON.String "c",JSON.String command,JSON.String prefix,JSON.Array args] =
+        go x ((if T.null prefix then "" else ":" <> prefix <> " ") <>
                command) (V.toList args)
-    f _ = Nothing
-    go !acc []                       = Just acc
-    go !acc [JSON.String txt] | T.count " " txt > 0
-                                     = Just (acc <> " :" <> txt)
-    go !acc (JSON.String txt : rest) = go (acc <> " " <> txt) rest
-    
-
-readLoop :: Client -> IO ()
-readLoop cl = go where
-    go = do x <- recv cl
-            forM_ x $ \t -> do
-                    T.IO.putStrLn (">>> " <> t)
-            threadDelay (1000 * 50)
-            go
-
-writeLoop :: Client -> IO ()
-writeLoop cl = go where
-    go = do x <- T.IO.getLine
-            send cl x
-            send cl "\n"
-            go
-
-
-{-main :: IO ()
-main = do
-    c <- connect "http://irc.w3.org/" "magicalclient2"
-    forkIO (readLoop c)
-    writeLoop c -}
+    f [JSON.String "disconnect" , JSON.String message] =
+        Disconnect message
+    f [JSON.String "connect"] =
+        Connect
+    f x = Err x "Unknown message type"
+            {- should have a custom datatype for parsing this stuff -}
+    go !x !acc []                       = Message acc
+    go !x !acc [JSON.String txt] | T.count " " txt > 0
+                                        = go x (acc <> " :" <> txt) []
+    go !x !acc (JSON.String txt : rest) = go x (acc <> " "  <> txt) rest
+    go !x !acc _ = Err x "Invalid c structure"
 
 main = do args <- getArgs
           case args of
-               [host, prefix] -> loop host prefix
-               _ -> putStrLn "wat"
+               [host, prefix, "quiet" ] -> loop Errors  host prefix
+               [host, prefix, "simple"] -> loop Simple  host prefix
+               [host, prefix, "all"   ] -> loop Verbose host prefix
+               [host, prefix] -> loop Simple host prefix
+               _ -> mapM_ putStrLn ["Example usage:"
+                                   ,"\t./relay http://webchat.network.net/ nickprefix_"
+                                   ,"you can optionally add a third parameter that sets the level of info you wanna get in stdout"
+                                   ,"\tall    - all messages"
+                                   ,"\tsimple - connection/disconnection and errors"
+                                   ,"\tquiet  - only errors"
+                                   ,"Invalid parameters will send you here!"]
 
-loop :: String -> String -> IO ()
-loop host prefix =
-    Net.serve (Net.Host "0.0.0.0") "1337" $ \(sock, remAddr) -> do
+data DLevel = Errors
+            | Simple
+            | Verbose
+    deriving (Show,Ord,Eq)
+
+loop :: DLevel -> String -> String -> IO ()
+loop curr host prefix =
+    Net.withSocketsDo $ Net.serve (Net.Host "0.0.0.0") "1337" $ \(sock, remAddr) -> do
             nick <- (\n -> prefix ++ show n) <$> randomRIO (1337,9001 :: Int)
-            putStrLn $ show remAddr ++ " connected [nick = " ++ nick ++ "]"
+            let logN l s = when (curr >= l) $
+                               putStrLn $ "[" ++ show remAddr ++ "/"++ nick ++"] "++ s
+
+            logN Simple "connecting..."
             cl <- connect (s2b host) nick
-            thId <- forkIO $ writer cl sock
-            reader cl sock
-            send cl "QUIT :killin' the mood"
-            killThread thId
+            case cl of
+                 Left e -> do logN Errors $ "error: " ++ show e
+                 Right cl -> do
+                        thId <- forkIO $ reader logN cl sock
+                        writer logN cl sock `finally` (do
+                                    killThread thId
+                                    send cl "QUIT :killin' the mood"
+                                    threadDelay 25000
+                                    Net.closeSock sock
+                                    logN Simple "disconnected")
     where
-        writer client sock = do
+        writer logN client sock = do
             x <- recv client
-            forM_ x $ \x' -> Net.send sock (T.E.encodeUtf8 x' <> "\n")
-            writer client sock
-        reader client sock = do
+            case x of
+                 Left e -> logN Errors $ "error: " ++ show e
+                 Right xp -> do
+                    l <- fmap (all id) $ forM xp $ \x' -> do
+                        case x' of
+                             Connect -> do
+                                 logN Simple $ "IRC server confirmed connection"
+                                 return True
+                             Err e msg -> do
+                                 logN Errors $ "error: " ++ show msg ++ show " on " ++ show e
+                                 return True
+                             Disconnect m -> do
+                                    logN Simple $
+                                        "disconnect msg from IRC server [" ++ show m ++ "]"
+                                    return False
+                             Message msg -> do
+                                    logN Verbose $ "Read from IRC: " ++ T.unpack msg
+                                    Net.send sock (T.E.encodeUtf8 msg <> "\n")
+                                    return True
+                    when l (writer logN client sock)
+            
+        reader logN client sock = do
             x <- Net.recv sock 1024
             case x of
                  Nothing -> return ()
-                 Just x' -> do send client (T.E.decodeUtf8 x')
-                               reader client sock
+                 Just x' -> do logN Verbose ("Read from socket: " ++ show x')
+                               send client (T.E.decodeUtf8 x')
+                               reader logN client sock
