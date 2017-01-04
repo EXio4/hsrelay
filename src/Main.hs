@@ -7,6 +7,9 @@ import Control.Concurrent
 import Control.Concurrent.MVar
 import Control.Concurrent.Chan
 import Data.Monoid
+import System.Random
+import System.Environment
+
 
 import qualified Data.ByteString.Char8 as C8
 import qualified Data.ByteString.Lazy  as L
@@ -14,8 +17,9 @@ import qualified Data.Vector           as V
 import qualified Data.Text             as T
 import qualified Data.Text.IO          as T.IO
 import qualified Data.Text.Encoding    as T.E
-import qualified Network.HTTP as HTTP
-import qualified Data.Aeson as JSON
+import qualified Network.Simple.TCP    as Net
+import qualified Network.HTTP          as HTTP
+import qualified Data.Aeson            as JSON
 
 --base_url = "https://qwebirc.swiftirc.net/"
 
@@ -43,9 +47,12 @@ request (MkClient base_url tim _) char params = do
         case ret of
              Left {} -> return Nothing
              Right (HTTP.Response {HTTP.rspBody=ret}) -> do
-                putStrLn ("URL : " <> url)
-                putStrLn ret
-                return $ JSON.decode . L.fromStrict . s2b $ ret
+                let v = JSON.decode . L.fromStrict . s2b $ ret
+                case v of Nothing -> do putStrLn "Error decoding (raw stuff)"
+                                        putStrLn $ "URL: " ++ url
+                                        putStrLn $ ret
+                                        return Nothing
+                          Just x -> return x
 
 
 connect :: C8.ByteString -> String -> IO Client
@@ -55,7 +62,7 @@ connect base_url nick = do
     session <- request tmpClient 'n' [("nick", nick)]
     case session of
          Just (_:JSON.String sess_id:_) -> return $ MkClient base_url tim sess_id
-         x -> error (show x)
+         x -> error "magic"
 
 send :: Client -> T.Text -> IO ()
 send client payload = do
@@ -94,8 +101,36 @@ writeLoop cl = go where
             send cl x
             go
 
-main :: IO ()
+
+{-main :: IO ()
 main = do
     c <- connect "http://irc.w3.org/" "magicalclient2"
     forkIO (readLoop c)
-    writeLoop c
+    writeLoop c -}
+
+main = do args <- getArgs
+          case args of
+               [host, prefix] -> loop host prefix
+               _ -> putStrLn "wat"
+
+loop :: String -> String -> IO ()
+loop host prefix =
+    Net.serve (Net.Host "0.0.0.0") "1337" $ \(sock, remAddr) -> do
+            nick <- (\n -> prefix ++ show n) <$> randomRIO (1337,9001 :: Int)
+            putStrLn $ show remAddr ++ " connected [nick = " ++ nick ++ " ]"
+            cl <- connect (s2b host) nick
+            thId <- forkIO $ writer cl sock
+            reader cl sock
+            send cl "QUIT :killin' the mood"
+            killThread thId
+    where
+        writer client sock = do
+            x <- recv client
+            forM_ x $ \x' -> Net.send sock (T.E.encodeUtf8 x')
+            writer client sock
+        reader client sock = do
+            x <- Net.recv sock 1024
+            case x of
+                 Nothing -> return ()
+                 Just x' -> do send client (T.E.decodeUtf8 x')
+                               reader client sock
