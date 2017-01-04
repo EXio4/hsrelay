@@ -119,7 +119,7 @@ loop :: String -> String -> IO ()
 loop host prefix =
     Net.serve (Net.Host "0.0.0.0") "1337" $ \(sock, remAddr) -> do
             nick <- (\n -> prefix ++ show n) <$> randomRIO (1337,9001 :: Int)
-            putStrLn $ show remAddr ++ " connected [nick = " ++ nick ++ " ]"
+            putStrLn $ show remAddr ++ " connected [nick = " ++ nick ++ "]"
             cl <- connect (s2b host) nick
             thId <- forkIO $ writer cl sock
             reader cl sock
