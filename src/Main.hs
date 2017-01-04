@@ -100,12 +100,12 @@ recv_magic xs = map f xs where
 
 main = do args <- getArgs
           case args of
-               [host, prefix, "quiet" ] -> loop Errors  host prefix
-               [host, prefix, "simple"] -> loop Simple  host prefix
-               [host, prefix, "all"   ] -> loop Verbose host prefix
-               [host, prefix] -> loop Simple host prefix
+               [host, port, prefix, "quiet" ] -> loop Errors  host port prefix
+               [host, port, prefix, "simple"] -> loop Simple  host port prefix
+               [host, port, prefix, "all"   ] -> loop Verbose host port prefix
+               [host, port, prefix] -> loop Simple host port prefix
                _ -> mapM_ putStrLn ["Example usage:"
-                                   ,"\t./relay http://webchat.network.net/ nickprefix_"
+                                   ,"\t./relay http://webchat.network.net/ 1337 nickprefix_"
                                    ,"you can optionally add a third parameter that sets the level of info you wanna get in stdout"
                                    ,"\tall    - all messages"
                                    ,"\tsimple - connection/disconnection and errors"
@@ -117,9 +117,9 @@ data DLevel = Errors
             | Verbose
     deriving (Show,Ord,Eq)
 
-loop :: DLevel -> String -> String -> IO ()
-loop curr host prefix =
-    Net.withSocketsDo $ Net.serve (Net.Host "0.0.0.0") "1337" $ \(sock, remAddr) -> do
+loop :: DLevel -> String -> String -> String -> IO ()
+loop curr host port prefix =
+    Net.withSocketsDo $ Net.serve (Net.Host "0.0.0.0") port $ \(sock, remAddr) -> do
             nick <- (\n -> prefix ++ show n) <$> randomRIO (1337,9001 :: Int)
             let logN l s = when (curr >= l) $
                                putStrLn $ "[" ++ show remAddr ++ "/"++ nick ++"] "++ s
