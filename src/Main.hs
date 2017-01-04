@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings,BangPatterns #-}
+{-# LANGUAGE OverloadedStrings,BangPatterns, MultiWayIf #-}
 module Main where
 
 import Control.Monad
@@ -161,9 +161,21 @@ loop curr host port prefix =
                     when l (writer logN client sock)
             
         reader logN client sock = do
-            x <- Net.recv sock 1024
+            x <- readLineFrom sock
             case x of
-                 Nothing -> return ()
+                 Nothing -> () <$ send client "QUIT :killin' the mod, twice."
                  Just x' -> do logN Verbose ("Read from socket: " ++ show x')
                                send client (T.E.decodeUtf8 x')
                                reader logN client sock
+
+readLineFrom :: Net.Socket -> IO (Maybe C8.ByteString)
+readLineFrom sock = do
+    c <- Net.recv sock 1
+    case c of Nothing -> return Nothing
+              Just c' -> Just <$> go' c'
+    where go' :: C8.ByteString -> IO C8.ByteString
+          go' c | c == "\n" || c == "" = return ""
+                | c == "\r" = do
+                        Net.recv sock 1 {- we hope there's always a \n after a \r -}
+                        return ""
+                | otherwise = (\y -> c <> maybe "" id y) <$> readLineFrom sock
