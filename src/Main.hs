@@ -83,7 +83,8 @@ recv_magic xs = foldr (<>) mempty $ map (\x -> (:[]) <$> f x) xs where
                command) (V.toList args)
     f _ = Nothing
     go !acc []                       = Just acc
-    go !acc [JSON.String txt]        = Just (acc <> " :" <> txt)
+    go !acc [JSON.String txt] | T.count " " txt > 0
+                                     = Just (acc <> " :" <> txt)
     go !acc (JSON.String txt : rest) = go (acc <> " " <> txt) rest
     
 
