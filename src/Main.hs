@@ -100,6 +100,7 @@ writeLoop :: Client -> IO ()
 writeLoop cl = go where
     go = do x <- T.IO.getLine
             send cl x
+            send cl "\n"
             go
 
 
@@ -127,7 +128,7 @@ loop host prefix =
     where
         writer client sock = do
             x <- recv client
-            forM_ x $ \x' -> Net.send sock (T.E.encodeUtf8 x')
+            forM_ x $ \x' -> Net.send sock (T.E.encodeUtf8 x' <> "\n")
             writer client sock
         reader client sock = do
             x <- Net.recv sock 1024
